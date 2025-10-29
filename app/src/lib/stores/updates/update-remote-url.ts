@@ -1,8 +1,8 @@
 import { IAPIRepository } from '../../api'
 import { GitStore } from '../git-store'
 import { urlMatchesRemote } from '../../repository-matching'
-import * as URL from 'url'
 import { GitHubRepository } from '../../../models/github-repository'
+import { parseRemote } from '../../remote-parsing'
 
 export async function updateRemoteUrl(
   gitStore: GitStore,
@@ -19,18 +19,34 @@ export async function updateRemoteUrl(
   const updatedRemoteUrl = apiRepo.clone_url
   const urlsMatch = urlMatchesRemote(updatedRemoteUrl, gitStore.defaultRemote)
 
-  // Verify that protocol hasn't changed. If it has we don't want
-  // to alter the protocol in case they are relying on a specific one.
-  // If protocol is null that implies the url is a ssh url
-  // of the format git@github.com:octocat/Hello-World.git, which
-  // can't be parsed by URL.parse. In this case we assume the user
-  // manually configured their remote to use this format and we don't
-  // want to change what they've done just to be safe
-  const parsedRemoteUrl = URL.parse(remoteUrl)
-  const parsedUpdatedRemoteUrl = URL.parse(updatedRemoteUrl)
+  // If the URLs already match, no need to update anything
+  if (urlsMatch) {
+    return
+  }
+
+  // Parse both the current remote URL and the API-provided clone URL
+  // to detect if the repository has been renamed
+  const parsedRemoteUrl = parseRemote(remoteUrl)
+  const parsedUpdatedRemoteUrl = parseRemote(updatedRemoteUrl)
+
+  // Check if the repository has been renamed (owner or name has changed)
+  // while keeping the same hostname
+  let repositoryRenamed = false
+  if (parsedRemoteUrl !== null && parsedUpdatedRemoteUrl !== null) {
+    const sameHost =
+      parsedRemoteUrl.hostname.toLowerCase() ===
+      parsedUpdatedRemoteUrl.hostname.toLowerCase()
+    const ownerChanged = parsedRemoteUrl.owner !== parsedUpdatedRemoteUrl.owner
+    const nameChanged = parsedRemoteUrl.name !== parsedUpdatedRemoteUrl.name
+
+    repositoryRenamed = sameHost && (ownerChanged || nameChanged)
+  }
+
+  // Determine if the protocols match by examining the parsed URLs
+  // If either parseRemote returns null (e.g., for SSH URLs), we consider them compatible
   const protocolsMatch =
-    parsedRemoteUrl.protocol !== null &&
-    parsedUpdatedRemoteUrl.protocol !== null &&
+    parsedRemoteUrl === null ||
+    parsedUpdatedRemoteUrl === null ||
     parsedRemoteUrl.protocol === parsedUpdatedRemoteUrl.protocol
 
   // Check if the default remote url has been manually changed from the
@@ -39,7 +55,22 @@ export async function updateRemoteUrl(
     gitStore.defaultRemote &&
     urlMatchesRemote(gitHubRepository.cloneURL, gitStore.defaultRemote)
 
-  if (protocolsMatch && remoteUrlUnchanged && !urlsMatch) {
+  // Update the remote URL if:
+  // 1. The repository has been renamed on GitHub (detected above), OR
+  // 2. The original conditions are met: protocols match, remote URL was
+  //    unchanged from the previous cloneURL, and URLs don't match
+  if (repositoryRenamed && parsedRemoteUrl !== null && parsedUpdatedRemoteUrl !== null) {
+    log.info(
+      `[updateRemoteUrl] Repository appears to have been renamed from ` +
+        `${parsedRemoteUrl.owner}/${parsedRemoteUrl.name} to ` +
+        `${parsedUpdatedRemoteUrl.owner}/${parsedUpdatedRemoteUrl.name}. ` +
+        `Updating remote URL from ${remoteUrl} to ${updatedRemoteUrl}`
+    )
+    await gitStore.setRemoteURL(gitStore.defaultRemote.name, updatedRemoteUrl)
+  } else if (protocolsMatch && remoteUrlUnchanged && !urlsMatch) {
+    log.info(
+      `[updateRemoteUrl] Updating remote URL from ${remoteUrl} to ${updatedRemoteUrl}`
+    )
     await gitStore.setRemoteURL(gitStore.defaultRemote.name, updatedRemoteUrl)
   }
 }
